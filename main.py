@@ -11,11 +11,11 @@ def root():
 def webhook():
     if request.method == "GET":
         return jsonify({"ok": True, "note": "send POST with JSON"}), 200
-
     data = request.get_json(force=True, silent=True) or {}
-    print("Received:", data, flush=True)  # shows in Render Logs
+    print("Received:", data, flush=True)
     return jsonify({"ok": True, "echo": data}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))  # use Render's PORT
+    print("URL MAP:", app.url_map, flush=True)
     app.run(host="0.0.0.0", port=port)
