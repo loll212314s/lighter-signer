@@ -1,82 +1,56 @@
-import os, hmac, hashlib, base64, json, urllib.request
+import os, json
 from flask import Flask, request, jsonify
+import lighter  # from requirements.txt (lighter-python)
 
 app = Flask(__name__)
 
-WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "")
-PRIVATE_KEY      = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTER_PRIVATE_KEY")
-PUBLIC_KEY       = os.environ.get("API_KEY_PUBLIC_KEY", "")
-ACCOUNT_INDEX    = int(os.environ.get("ACCOUNT_INDEX", "0"))
-API_KEY_INDEX    = int(os.environ.get("API_KEY_INDEX", "0"))
-LIGHTER_ORDERS_URL = os.environ.get("LIGHTER_ORDERS_URL", "").strip()  # leave blank for dry-run
+BASE_URL       = os.environ.get("BASE_URL", "https://mainnet.zklighter.elliot.ai")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+API_PRIV       = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTER_PRIVATE_KEY")
+ACCOUNT_INDEX  = int(os.environ.get("ACCOUNT_INDEX", "0"))
+API_KEY_INDEX  = int(os.environ.get("API_KEY_INDEX", "0"))
 
-def hmac_b64(message: str, key: str) -> str:
-    mac = hmac.new(key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(mac).decode("utf-8").rstrip("=")
+signer = lighter.SignerClient(
+    url=BASE_URL,
+    private_key=API_PRIV,
+    account_index=ACCOUNT_INDEX,
+    api_key_index=API_KEY_INDEX,
+)
+tx_api = lighter.TransactionApi(url=BASE_URL)
 
 @app.get("/")
 def root():
     return jsonify({"status": "ok"})
 
-@app.post("/sign")
-def sign():
-    if not PRIVATE_KEY:
-        return jsonify({"ok": False, "error": "missing API_KEY_PRIVATE_KEY"}), 500
-    raw = request.get_data(as_text=True) or ""
-    if raw.strip() == "":
-        raw = "{}"
-    sig = hmac_b64(raw, PRIVATE_KEY)
-    print("Sign request:", raw, "->", sig, flush=True)
-    return jsonify({"ok": True, "message": raw, "signature": sig})
-
-@app.route("/webhook", methods=["GET", "POST"])
+@app.post("/webhook")
 def webhook():
-    if request.method == "GET":
-        return jsonify({"ok": True, "note": "send POST with JSON"}), 200
-    if not PRIVATE_KEY:
-        return jsonify({"ok": False, "error": "missing API_KEY_PRIVATE_KEY"}), 500
-
-    data = request.get_json(force=True, silent=True) or {}
-
-    # password for TradingView
-    if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
-        print("bad secret:", data.get("secret"), flush=True)
+    body = request.get_json(force=True, silent=True) or {}
+    if WEBHOOK_SECRET and body.get("secret") != WEBHOOK_SECRET:
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
-    # inner payload from TV (strip secret)
-    payload = {k: v for k, v in data.items() if k != "secret"}
+    # Example payload from TradingView:
+    # {"secret":"...","symbol":"BTC-USDC","side":"buy","qty":"0.0001"}
+    symbol = str(body.get("symbol", "BTC-USDC"))
+    side   = str(body.get("side", "buy")).lower()
+    qty    = float(str(body.get("qty", "0.0001")))
 
-    # sign payload
-    message   = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-    signature = hmac_b64(message, PRIVATE_KEY)
+    # Scale to base units (adjust if your market uses different decimals)
+    base_amount = int(qty * 1_0000_0000)  # 1e8
 
-    signed_packet = {
-        "public_key": PUBLIC_KEY,
-        "account_index": ACCOUNT_INDEX,
-        "api_key_index": API_KEY_INDEX,
-        "message": message,
-        "signature": signature
-    }
+    # MARKET IOC (safe tiny test)
+    signed_tx = signer.sign_create_order(
+        market=symbol,
+        side=side,
+        base_amount=base_amount,
+        price=0,  # market
+        client_order_index=0,
+        time_in_force="ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+        order_type="ORDER_TYPE_MARKET",
+    )
 
-    print("Verified TV alert:", payload, flush=True)
-    print("SignedForLighter:", json.dumps(signed_packet), flush=True)
-
-    # optionally POST to Lighter if URL is set
-    if LIGHTER_ORDERS_URL:
-        try:
-            req = urllib.request.Request(
-                LIGHTER_ORDERS_URL,
-                data=json.dumps(signed_packet).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                body = resp.read().decode("utf-8", "ignore")
-                print("LighterResp:", resp.status, body[:500], flush=True)
-        except Exception as e:
-            print("LighterErr:", repr(e), flush=True)
-
-    return jsonify({"ok": True, "prepared_for_lighter": bool(LIGHTER_ORDERS_URL)}), 200
+    resp = tx_api.send_tx(signed_tx)
+    print("Lighter send_tx response:", resp, flush=True)
+    return jsonify({"ok": True, "lighter_response": resp})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
