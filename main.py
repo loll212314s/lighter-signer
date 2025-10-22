@@ -10,31 +10,44 @@ API_PRIV       = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTE
 ACCOUNT_INDEX  = int(os.environ.get("ACCOUNT_INDEX", "0"))
 API_KEY_INDEX  = int(os.environ.get("API_KEY_INDEX", "0"))
 
-# lazy-initialized SDK clients (so we can ensure an event loop exists)
-_app_clients_key = "_lighter_clients"
+# cache key for clients
+_CLIENTS_KEY = "_lighter_clients"
+
+async def _make_clients_async():
+    """
+    Create SDK clients inside a *running* asyncio loop so aiohttp is happy.
+    """
+    signer = lighter.SignerClient(
+        url=BASE_URL,
+        private_key=API_PRIV,
+        account_index=ACCOUNT_INDEX,
+        api_key_index=API_KEY_INDEX,
+    )
+    tx_api = lighter.TransactionApi(url=BASE_URL)
+    return signer, tx_api
 
 def get_clients():
     """
-    Ensure an asyncio event loop exists, then create and cache SignerClient + TransactionApi.
+    Ensure a loop exists, run the async constructor inside it once, then cache.
     """
-    # make sure there is a running loop for aiohttp used by the SDK
+    clients = app.config.get(_CLIENTS_KEY)
+    if clients is not None:
+        return clients
+
     try:
-        asyncio.get_running_loop()
+        loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-    clients = app.config.get(_app_clients_key)
-    if clients is None:
-        signer = lighter.SignerClient(
-            url=BASE_URL,
-            private_key=API_PRIV,
-            account_index=ACCOUNT_INDEX,
-            api_key_index=API_KEY_INDEX,
-        )
-        tx_api = lighter.TransactionApi(url=BASE_URL)
-        clients = (signer, tx_api)
-        app.config[_app_clients_key] = clients
+    if not loop.is_running():
+        clients = loop.run_until_complete(_make_clients_async())
+    else:
+        # if somehow already running (unlikely under Flask), schedule it
+        fut = asyncio.run_coroutine_threadsafe(_make_clients_async(), loop)
+        clients = fut.result()
+
+    app.config[_CLIENTS_KEY] = clients
     return clients
 
 @app.get("/")
