@@ -7,8 +7,11 @@ app = Flask(__name__)
 def root():
     return jsonify({"status": "ok"})
 
-@app.post("/webhook")
+@app.route("/webhook", methods=["GET", "POST"])
 def webhook():
+    if request.method == "GET":
+        return jsonify({"ok": True, "note": "send POST with JSON"}), 200
+
     data = request.get_json(force=True, silent=True) or {}
     print("Received:", data, flush=True)  # shows in Render Logs
     return jsonify({"ok": True, "echo": data}), 200
