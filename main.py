@@ -1,4 +1,4 @@
-import os, json
+import os, json, asyncio
 from flask import Flask, request, jsonify
 import lighter  # from requirements.txt (lighter-python)
 
@@ -10,13 +10,32 @@ API_PRIV       = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTE
 ACCOUNT_INDEX  = int(os.environ.get("ACCOUNT_INDEX", "0"))
 API_KEY_INDEX  = int(os.environ.get("API_KEY_INDEX", "0"))
 
-signer = lighter.SignerClient(
-    url=BASE_URL,
-    private_key=API_PRIV,
-    account_index=ACCOUNT_INDEX,
-    api_key_index=API_KEY_INDEX,
-)
-tx_api = lighter.TransactionApi(url=BASE_URL)
+# lazy-initialized SDK clients (so we can ensure an event loop exists)
+_app_clients_key = "_lighter_clients"
+
+def get_clients():
+    """
+    Ensure an asyncio event loop exists, then create and cache SignerClient + TransactionApi.
+    """
+    # make sure there is a running loop for aiohttp used by the SDK
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    clients = app.config.get(_app_clients_key)
+    if clients is None:
+        signer = lighter.SignerClient(
+            url=BASE_URL,
+            private_key=API_PRIV,
+            account_index=ACCOUNT_INDEX,
+            api_key_index=API_KEY_INDEX,
+        )
+        tx_api = lighter.TransactionApi(url=BASE_URL)
+        clients = (signer, tx_api)
+        app.config[_app_clients_key] = clients
+    return clients
 
 @app.get("/")
 def root():
@@ -28,16 +47,16 @@ def webhook():
     if WEBHOOK_SECRET and body.get("secret") != WEBHOOK_SECRET:
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
-    # Example payload from TradingView:
-    # {"secret":"...","symbol":"BTC-USDC","side":"buy","qty":"0.0001"}
     symbol = str(body.get("symbol", "BTC-USDC"))
     side   = str(body.get("side", "buy")).lower()
     qty    = float(str(body.get("qty", "0.0001")))
 
-    # Scale to base units (adjust if your market uses different decimals)
-    base_amount = int(qty * 1_0000_0000)  # 1e8
+    # scale to base units (example: 1e8)
+    base_amount = int(qty * 1_0000_0000)
 
-    # MARKET IOC (safe tiny test)
+    signer, tx_api = get_clients()
+
+    # MARKET IOC
     signed_tx = signer.sign_create_order(
         market=symbol,
         side=side,
