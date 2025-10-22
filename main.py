@@ -1,15 +1,14 @@
 import os, hmac, hashlib, base64, json, urllib.request
-
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-PRIVATE_KEY   = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTER_PRIVATE_KEY")
-PUBLIC_KEY    = os.environ.get("API_KEY_PUBLIC_KEY", "")
-ACCOUNT_INDEX = int(os.environ.get("ACCOUNT_INDEX", "0"))
-API_KEY_INDEX = int(os.environ.get("API_KEY_INDEX", "0"))
-LIGHTER_ORDERS_URL = os.environ.get("LIGHTER_ORDERS_URL", "").strip()  # set this later
+WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "")
+PRIVATE_KEY      = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTER_PRIVATE_KEY")
+PUBLIC_KEY       = os.environ.get("API_KEY_PUBLIC_KEY", "")
+ACCOUNT_INDEX    = int(os.environ.get("ACCOUNT_INDEX", "0"))
+API_KEY_INDEX    = int(os.environ.get("API_KEY_INDEX", "0"))
+LIGHTER_ORDERS_URL = os.environ.get("LIGHTER_ORDERS_URL", "").strip()  # leave blank for dry-run
 
 def hmac_b64(message: str, key: str) -> str:
     mac = hmac.new(key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).digest()
@@ -34,22 +33,21 @@ def sign():
 def webhook():
     if request.method == "GET":
         return jsonify({"ok": True, "note": "send POST with JSON"}), 200
-
     if not PRIVATE_KEY:
         return jsonify({"ok": False, "error": "missing API_KEY_PRIVATE_KEY"}), 500
 
     data = request.get_json(force=True, silent=True) or {}
 
-    # 1) TradingView password
+    # password for TradingView
     if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
         print("bad secret:", data.get("secret"), flush=True)
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
-    # 2) inner payload from TV (remove secret)
+    # inner payload from TV (strip secret)
     payload = {k: v for k, v in data.items() if k != "secret"}
 
-    # 3) sign payload
-    message = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    # sign payload
+    message   = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     signature = hmac_b64(message, PRIVATE_KEY)
 
     signed_packet = {
@@ -63,7 +61,7 @@ def webhook():
     print("Verified TV alert:", payload, flush=True)
     print("SignedForLighter:", json.dumps(signed_packet), flush=True)
 
-    # 4) optionally POST to Lighter if URL is configured
+    # optionally POST to Lighter if URL is set
     if LIGHTER_ORDERS_URL:
         try:
             req = urllib.request.Request(
