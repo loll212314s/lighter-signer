@@ -1,6 +1,11 @@
-import os, json, asyncio
+import os, json, asyncio, logging
 from flask import Flask, request, jsonify
 import lighter  # from requirements.txt (lighter-python)
+
+# --- tame the log spam ---
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+logging.getLogger("werkzeug").setLevel(logging.INFO)
 
 app = Flask(__name__)
 
@@ -10,25 +15,29 @@ API_PRIV       = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTE
 ACCOUNT_INDEX  = int(os.environ.get("ACCOUNT_INDEX", "0"))
 API_KEY_INDEX  = int(os.environ.get("API_KEY_INDEX", "0"))
 
-# cache key for clients
 _CLIENTS_KEY = "_lighter_clients"
 
 async def _make_clients_async():
     """
-    Create SDK clients inside a *running* asyncio loop so aiohttp is happy.
+    Build SDK clients inside a running loop so aiohttp is happy.
+    NOTE: TransactionApi takes an ApiClient, not 'url='.
     """
+    # SignerClient accepts url + keys
     signer = lighter.SignerClient(
         url=BASE_URL,
         private_key=API_PRIV,
         account_index=ACCOUNT_INDEX,
         api_key_index=API_KEY_INDEX,
     )
-    tx_api = lighter.TransactionApi(url=BASE_URL)
+    # TransactionApi requires ApiClient(Configuration(host=...))
+    cfg = lighter.Configuration(host=BASE_URL)
+    api_client = lighter.ApiClient(configuration=cfg)
+    tx_api = lighter.TransactionApi(api_client)
     return signer, tx_api
 
 def get_clients():
     """
-    Ensure a loop exists, run the async constructor inside it once, then cache.
+    Ensure a loop exists; create and cache SignerClient + TransactionApi once.
     """
     clients = app.config.get(_CLIENTS_KEY)
     if clients is not None:
@@ -43,7 +52,6 @@ def get_clients():
     if not loop.is_running():
         clients = loop.run_until_complete(_make_clients_async())
     else:
-        # if somehow already running (unlikely under Flask), schedule it
         fut = asyncio.run_coroutine_threadsafe(_make_clients_async(), loop)
         clients = fut.result()
 
