@@ -18,14 +18,12 @@ API_KEY_INDEX  = int(os.environ.get("API_KEY_INDEX", "0"))
 _CLIENTS_KEY = "_lighter_clients"
 
 async def _make_clients_async():
-    # SignerClient accepts url + keys
     signer = lighter.SignerClient(
         url=BASE_URL,
         private_key=API_PRIV,
         account_index=ACCOUNT_INDEX,
         api_key_index=API_KEY_INDEX,
     )
-    # TransactionApi requires ApiClient(Configuration(host=...))
     cfg = lighter.Configuration(host=BASE_URL)
     api_client = lighter.ApiClient(configuration=cfg)
     tx_api = lighter.TransactionApi(api_client)
@@ -61,19 +59,21 @@ def webhook():
     symbol = str(body.get("symbol", "BTC-USDC"))
     side   = str(body.get("side", "buy")).lower()
     qty    = float(str(body.get("qty", "0.0001")))
-    base_amount = int(qty * 1_0000_0000)  # scale example: 1e8
+    base_amount = int(qty * 1_0000_0000)  # example: 1e8 scale
 
     signer, tx_api = get_clients()
 
-    # IMPORTANT: positional args (no keywords)
+    # POSitional args incl. reduce_only, trigger_price
     signed_tx = signer.sign_create_order(
         symbol,                                   # market
-        side,                                     # "buy" / "sell"
+        side,                                     # "buy"/"sell"
         base_amount,                              # int
         0,                                        # price (0 = market)
         0,                                        # client_order_index
         "ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
         "ORDER_TYPE_MARKET",
+        False,                                    # reduce_only
+        0,                                        # trigger_price (0 for non-trigger)
     )
 
     resp = tx_api.send_tx(signed_tx)
