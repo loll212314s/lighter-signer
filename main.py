@@ -4,7 +4,10 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-PRIVATE_KEY = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTER_PRIVATE_KEY")
+PRIVATE_KEY   = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTER_PRIVATE_KEY")
+PUBLIC_KEY    = os.environ.get("API_KEY_PUBLIC_KEY", "")
+ACCOUNT_INDEX = int(os.environ.get("ACCOUNT_INDEX", "0"))
+API_KEY_INDEX = int(os.environ.get("API_KEY_INDEX", "0"))
 
 def hmac_b64(message: str, key: str) -> str:
     mac = hmac.new(key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).digest()
@@ -16,7 +19,6 @@ def root():
 
 @app.post("/sign")
 def sign():
-    """Sign the RAW body you send (e.g. {"symbol":"BTCUSDT","side":"buy","qty":"0.001"})."""
     if not PRIVATE_KEY:
         return jsonify({"ok": False, "error": "missing API_KEY_PRIVATE_KEY"}), 500
     raw = request.get_data(as_text=True) or ""
@@ -31,41 +33,38 @@ def webhook():
     if request.method == "GET":
         return jsonify({"ok": True, "note": "send POST with JSON"}), 200
 
+    if not PRIVATE_KEY:
+        return jsonify({"ok": False, "error": "missing API_KEY_PRIVATE_KEY"}), 500
+
     data = request.get_json(force=True, silent=True) or {}
 
-    # 1) simple password check (TradingView can't set headers)
+    # 1) simple TradingView password
     if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
         print("bad secret:", data.get("secret"), flush=True)
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
-    # 2) SIGNATURE CHECK
-    # Expect structure:
-    # {
-    #   "secret":"<WEBHOOK_SECRET>",
-    #   "message":"{\"symbol\":\"BTCUSDT\",\"side\":\"buy\",\"qty\":\"0.001\"}",
-    #   "signature":"<base64urlsafe HMAC-SHA256 of message using PRIVATE_KEY>"
-    # }
-    if not PRIVATE_KEY:
-        return jsonify({"ok": False, "error": "missing API_KEY_PRIVATE_KEY"}), 500
+    # 2) inner trading payload (what we’ll sign for Lighter)
+    # example from TradingView: {"secret":"...","symbol":"BTCUSDT","side":"buy","qty":"0.001"}
+    payload = {k: v for k, v in data.items() if k != "secret"}
+    # you can extend payload with leverage, reduceOnly, etc.
 
-    message = data.get("message")
-    signature = data.get("signature")
-    if not isinstance(message, str) or not isinstance(signature, str):
-        return jsonify({"ok": False, "error": "missing message or signature"}), 400
+    # 3) sign the inner payload for Lighter
+    message = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    signature = hmac_b64(message, PRIVATE_KEY)
 
-    expected = hmac_b64(message, PRIVATE_KEY)
-    if signature != expected:
-        print("bad sig:", signature, "expected:", expected, flush=True)
-        return jsonify({"ok": False, "error": "bad signature"}), 401
+    signed_packet = {
+        "public_key": PUBLIC_KEY,     # desktop public key
+        "account_index": ACCOUNT_INDEX,
+        "api_key_index": API_KEY_INDEX,
+        "message": message,           # string
+        "signature": signature        # base64url HMAC-SHA256 of message
+    }
 
-    # parse the inner payload to act on it
-    try:
-        inner = json.loads(message)
-    except Exception as e:
-        return jsonify({"ok": False, "error": "invalid inner message", "detail": str(e)}), 400
+    print("Verified TV alert:", payload, flush=True)
+    print("SignedForLighter:", json.dumps(signed_packet), flush=True)
 
-    print("Verified:", inner, flush=True)
-    return jsonify({"ok": True, "verified": True, "payload": inner}), 200
+    # (next step we’ll POST signed_packet to Lighter’s order endpoint)
+    return jsonify({"ok": True, "prepared_for_lighter": signed_packet}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
