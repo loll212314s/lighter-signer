@@ -1,4 +1,5 @@
-import os, hmac, hashlib, base64, json
+import os, hmac, hashlib, base64, json, urllib.request
+
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -8,6 +9,7 @@ PRIVATE_KEY   = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTER
 PUBLIC_KEY    = os.environ.get("API_KEY_PUBLIC_KEY", "")
 ACCOUNT_INDEX = int(os.environ.get("ACCOUNT_INDEX", "0"))
 API_KEY_INDEX = int(os.environ.get("API_KEY_INDEX", "0"))
+LIGHTER_ORDERS_URL = os.environ.get("LIGHTER_ORDERS_URL", "").strip()  # set this later
 
 def hmac_b64(message: str, key: str) -> str:
     mac = hmac.new(key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).digest()
@@ -38,33 +40,45 @@ def webhook():
 
     data = request.get_json(force=True, silent=True) or {}
 
-    # 1) simple TradingView password
+    # 1) TradingView password
     if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
         print("bad secret:", data.get("secret"), flush=True)
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
-    # 2) inner trading payload (what we’ll sign for Lighter)
-    # example from TradingView: {"secret":"...","symbol":"BTCUSDT","side":"buy","qty":"0.001"}
+    # 2) inner payload from TV (remove secret)
     payload = {k: v for k, v in data.items() if k != "secret"}
-    # you can extend payload with leverage, reduceOnly, etc.
 
-    # 3) sign the inner payload for Lighter
+    # 3) sign payload
     message = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     signature = hmac_b64(message, PRIVATE_KEY)
 
     signed_packet = {
-        "public_key": PUBLIC_KEY,     # desktop public key
+        "public_key": PUBLIC_KEY,
         "account_index": ACCOUNT_INDEX,
         "api_key_index": API_KEY_INDEX,
-        "message": message,           # string
-        "signature": signature        # base64url HMAC-SHA256 of message
+        "message": message,
+        "signature": signature
     }
 
     print("Verified TV alert:", payload, flush=True)
     print("SignedForLighter:", json.dumps(signed_packet), flush=True)
 
-    # (next step we’ll POST signed_packet to Lighter’s order endpoint)
-    return jsonify({"ok": True, "prepared_for_lighter": signed_packet}), 200
+    # 4) optionally POST to Lighter if URL is configured
+    if LIGHTER_ORDERS_URL:
+        try:
+            req = urllib.request.Request(
+                LIGHTER_ORDERS_URL,
+                data=json.dumps(signed_packet).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read().decode("utf-8", "ignore")
+                print("LighterResp:", resp.status, body[:500], flush=True)
+        except Exception as e:
+            print("LighterErr:", repr(e), flush=True)
+
+    return jsonify({"ok": True, "prepared_for_lighter": bool(LIGHTER_ORDERS_URL)}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
