@@ -1,4 +1,4 @@
-# main.py — Lighter webhook (dual-signature support)
+# main.py — Lighter webhook (create_market_order signature-agnostic, dual-sig-v2)
 import os, json, asyncio, logging
 from flask import Flask, request, jsonify
 import lighter  # pip install lighter-python
@@ -14,7 +14,7 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 API_PRIV = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTER_PRIVATE_KEY")
 ACCOUNT_INDEX = os.environ.get("ACCOUNT_INDEX")
 API_KEY_INDEX = os.environ.get("API_KEY_INDEX")
-MARKET_INDEX = os.environ.get("MARKET_INDEX")
+MARKET_INDEX = os.environ.get("MARKET_INDEX")  # default
 
 _CLIENTS_KEY = "_lighter_clients"
 
@@ -39,25 +39,23 @@ async def _make_clients_async():
     return signer, tx_api
 
 def _get_clients():
-    clients = app.config.get(_CLIENTS_KEY)
-    if clients is not None:
-        return clients
+    c = app.config.get(_CLIENTS_KEY)
+    if c: return c
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
     if not loop.is_running():
-        clients = loop.run_until_complete(_make_clients_async())
+        c = loop.run_until_complete(_make_clients_async())
     else:
         fut = asyncio.run_coroutine_threadsafe(_make_clients_async(), loop)
-        clients = fut.result()
-    app.config[_CLIENTS_KEY] = clients
-    return clients
+        c = fut.result()
+    app.config[_CLIENTS_KEY] = c
+    return c
 
 @app.get("/")
 def root():
-    return jsonify({"status": "ok", "version": "dual-sig-v1"})
+    return jsonify({"status": "ok", "version": "dual-sig-v2"})
 
 @app.post("/webhook")
 def webhook():
@@ -69,9 +67,9 @@ def webhook():
     if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
-    # side -> is_ask (sell/short = ask)
+    # side -> is_ask (sell/short = ask=true, buy/long = ask=false)
     side_str = str(data.get("side", "buy")).lower()
-    is_ask = True if side_str in ("sell", "short") else False
+    is_ask = side_str in ("sell", "short")
 
     # qty
     try:
@@ -87,34 +85,45 @@ def webhook():
     except Exception as e:
         return jsonify({"ok": False, "error": f"bad market_index: {e}"}), 400
 
-    # convert to base units (e.g., 1e8)
+    # convert to base units (example scale 1e8)
     base_amount = int(qty * 1_0000_0000)
 
     try:
         signer, tx_api = _get_clients()
-        # Try both known SDK signatures:
-        # A) (market_index, base_amount, is_ask, client_order_index)
-        # B) (market_index, is_ask, base_amount, client_order_index)
-        try:
-            signed_tx = signer.create_market_order(
-                int(market_index),
-                int(base_amount),
-                bool(is_ask),
-                0
-            )
-            print("create_market_order signature A used", flush=True)
-        except TypeError:
-            signed_tx = signer.create_market_order(
-                int(market_index),
-                bool(is_ask),
-                int(base_amount),
-                0
-            )
-            print("create_market_order signature B used", flush=True)
+
+        # Try multiple known SDK signatures. We stop at the first that works.
+        mi = int(market_index); ba = int(base_amount); ia = bool(is_ask)
+        attempts = [
+            ( (mi, ba, ia, 0), {} ),                                # A: (mi, base_amount, is_ask, coi)
+            ( (mi, ia, ba, 0), {} ),                                # B: (mi, is_ask, base_amount, coi)
+            ( (), {"market_index": mi, "base_amount": ba, "is_ask": ia, "client_order_index": 0} ),   # C kwargs
+            ( (), {"market_index": mi, "is_ask": ia, "base_amount": ba, "client_order_index": 0} ),   # D kwargs alt
+            ( (mi, 0, ba, ia, 0), {} ),                             # E: (mi, price=0, base_amount, is_ask, coi)
+            ( (mi, 0, ia, ba, 0), {} ),                             # F: (mi, price=0, is_ask, base_amount, coi)
+        ]
+
+        last_err = None
+        signed_tx = None
+        for args, kwargs in attempts:
+            try:
+                signed_tx = signer.create_market_order(*args, **kwargs)
+                print("create_market_order pattern OK:", (args or kwargs), flush=True)
+                break
+            except TypeError as e:
+                last_err = str(e)
+                continue
+
+        if not signed_tx:
+            return jsonify({
+                "ok": False,
+                "error": "send_tx failed",
+                "detail": f"no matching create_market_order signature; last: {last_err}"
+            }), 400
 
         resp = tx_api.send_tx(signed_tx)
         print("Lighter send_tx response:", resp, flush=True)
         return jsonify({"ok": True, "lighter_response": resp}), 200
+
     except Exception as e:
         return jsonify({"ok": False, "error": "send_tx failed", "detail": str(e)}), 400
 
