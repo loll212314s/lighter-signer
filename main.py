@@ -1,33 +1,34 @@
 
-# main.py — Lighter webhook (final, uses SDK helper to avoid enum errors)
+# main.py — Lighter webhook using SDK (final, single-file)
 import os, json, asyncio, logging
 from flask import Flask, request, jsonify
-import lighter  # from requirements.txt (lighter-python)
+import lighter  # lighter-python
 
-# calm noisy logs
+# Reduce noisy logs
+logging.getLogger("werkzeug").setLevel(logging.INFO)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
-logging.getLogger("werkzeug").setLevel(logging.INFO)
 
 app = Flask(__name__)
 
-# --- REQUIRED ENVs ---
+# --- Required ENV ---
 BASE_URL = os.environ.get("BASE_URL", "https://mainnet.zklighter.elliot.ai").rstrip("/")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 API_PRIV = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTER_PRIVATE_KEY")
+ETH_PRIVATE_KEY = os.environ.get("ETH_PRIVATE_KEY", "")  # available if needed by SDK
 ACCOUNT_INDEX = os.environ.get("ACCOUNT_INDEX")
 API_KEY_INDEX = os.environ.get("API_KEY_INDEX")
-MARKET_INDEX = os.environ.get("MARKET_INDEX")  # default market index (e.g., 1 for BTC-USDC)
+MARKET_INDEX = os.environ.get("MARKET_INDEX")  # default market index (e.g., 1 = BTC-USDC)
 
 _CLIENTS_KEY = "_lighter_clients"
 
-def _missing_envs():
-    miss = []
-    if not API_PRIV: miss.append("API_KEY_PRIVATE_KEY")
-    if ACCOUNT_INDEX is None: miss.append("ACCOUNT_INDEX")
-    if API_KEY_INDEX is None: miss.append("API_KEY_INDEX")
-    if MARKET_INDEX is None: miss.append("MARKET_INDEX")
-    return miss
+def _need_envs():
+    missing = []
+    if not API_PRIV: missing.append("API_KEY_PRIVATE_KEY")
+    if ACCOUNT_INDEX is None: missing.append("ACCOUNT_INDEX")
+    if API_KEY_INDEX is None: missing.append("API_KEY_INDEX")
+    if MARKET_INDEX is None: missing.append("MARKET_INDEX")
+    return missing
 
 async def _make_clients_async():
     signer = lighter.SignerClient(
@@ -65,43 +66,39 @@ def root():
 @app.post("/webhook")
 def webhook():
     # Check envs first
-    miss = _missing_envs()
+    miss = _need_envs()
     if miss:
         return jsonify({"ok": False, "error": "missing env", "need": miss}), 400
 
-    body = request.get_json(force=True, silent=True) or {}
-    if WEBHOOK_SECRET and body.get("secret") != WEBHOOK_SECRET:
+    data = request.get_json(force=True, silent=True) or {}
+    if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
-    # Inputs
-    side = str(body.get("side", "buy")).lower()  # "buy" / "sell"
+    side = str(data.get("side", "buy")).lower()  # "buy" or "sell"
     try:
-        qty = float(str(body.get("qty", "0.0001")))
+        qty = float(str(data.get("qty", "0.0001")))
     except Exception:
         return jsonify({"ok": False, "error": "bad qty"}), 400
     if qty <= 0:
         return jsonify({"ok": False, "error": "qty must be > 0"}), 400
 
-    # Market index can be overridden by body; else use env
     try:
-        market_index = int(body.get("market_index", MARKET_INDEX))
+        market_index = int(data.get("market_index", MARKET_INDEX))
     except Exception as e:
         return jsonify({"ok": False, "error": f"bad market_index: {e}"}), 400
 
-    # Scale to base units (example: 1e8)
+    # convert to base units (example: 1e8)
     base_amount = int(qty * 1_0000_0000)
 
     try:
         signer, tx_api = _get_clients()
-
-        # Use SDK helper to avoid enum integer issues
+        # Use SDK helper to avoid enum/int issues
         signed_tx = signer.create_market_order(
             market_index=market_index,
             side=side,  # "buy" or "sell"
             base_amount=base_amount,
             client_order_index=0,
         )
-
         resp = tx_api.send_tx(signed_tx)
         print("Lighter send_tx response:", resp, flush=True)
         return jsonify({"ok": True, "lighter_response": resp}), 200
