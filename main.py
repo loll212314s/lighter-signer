@@ -1,8 +1,7 @@
-
-# main.py — Lighter webhook using SDK (final is_ask signature)
+# main.py — Lighter webhook (dual-signature support)
 import os, json, asyncio, logging
 from flask import Flask, request, jsonify
-import lighter  # lighter-python
+import lighter  # pip install lighter-python
 
 logging.getLogger("werkzeug").setLevel(logging.INFO)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -58,7 +57,7 @@ def _get_clients():
 
 @app.get("/")
 def root():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "version": "dual-sig-v1"})
 
 @app.post("/webhook")
 def webhook():
@@ -70,9 +69,11 @@ def webhook():
     if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
+    # side -> is_ask (sell/short = ask)
     side_str = str(data.get("side", "buy")).lower()
-    is_ask = True if side_str in ("sell","short") else False  # SELL => ask
+    is_ask = True if side_str in ("sell", "short") else False
 
+    # qty
     try:
         qty = float(str(data.get("qty", "0.0001")))
     except Exception:
@@ -80,23 +81,37 @@ def webhook():
     if qty <= 0:
         return jsonify({"ok": False, "error": "qty must be > 0"}), 400
 
+    # market index
     try:
         market_index = int(data.get("market_index", MARKET_INDEX))
     except Exception as e:
         return jsonify({"ok": False, "error": f"bad market_index: {e}"}), 400
 
-    # scale to base units (e.g., 1e8)
+    # convert to base units (e.g., 1e8)
     base_amount = int(qty * 1_0000_0000)
 
     try:
         signer, tx_api = _get_clients()
-        # Signature expected by your SDK: (market_index, base_amount, is_ask, client_order_index)
-        signed_tx = signer.create_market_order(
-            int(market_index),
-            int(base_amount),
-            bool(is_ask),
-            0
-        )
+        # Try both known SDK signatures:
+        # A) (market_index, base_amount, is_ask, client_order_index)
+        # B) (market_index, is_ask, base_amount, client_order_index)
+        try:
+            signed_tx = signer.create_market_order(
+                int(market_index),
+                int(base_amount),
+                bool(is_ask),
+                0
+            )
+            print("create_market_order signature A used", flush=True)
+        except TypeError:
+            signed_tx = signer.create_market_order(
+                int(market_index),
+                bool(is_ask),
+                int(base_amount),
+                0
+            )
+            print("create_market_order signature B used", flush=True)
+
         resp = tx_api.send_tx(signed_tx)
         print("Lighter send_tx response:", resp, flush=True)
         return jsonify({"ok": True, "lighter_response": resp}), 200
@@ -105,5 +120,4 @@ def webhook():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    print("URL MAP:", app.url_map, flush=True)
     app.run(host="0.0.0.0", port=port)
