@@ -1,24 +1,23 @@
-# main.py  — final, minimal, no guessing
+# main.py — final: side enum fix (buy=0, sell=1)
 import os, json, asyncio, logging
 from flask import Flask, request, jsonify
 import lighter  # from requirements.txt (lighter-python)
 
-# keep logs calm
+# calm logs
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 logging.getLogger("werkzeug").setLevel(logging.INFO)
 
 app = Flask(__name__)
 
-# --- ENV (REQUIRED) ---
+# REQUIRED ENVs
 BASE_URL        = os.environ.get("BASE_URL", "https://mainnet.zklighter.elliot.ai").rstrip("/")
-WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "")  # set already
+WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "")
 API_PRIV        = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTER_PRIVATE_KEY")
-ACCOUNT_INDEX   = os.environ.get("ACCOUNT_INDEX")        # string -> later int
-API_KEY_INDEX   = os.environ.get("API_KEY_INDEX")        # string -> later int
-MARKET_INDEX    = os.environ.get("MARKET_INDEX")         # string -> later int (symbol index, e.g., BTC-USDC => 1)
+ACCOUNT_INDEX   = os.environ.get("ACCOUNT_INDEX")
+API_KEY_INDEX   = os.environ.get("API_KEY_INDEX")
+MARKET_INDEX    = os.environ.get("MARKET_INDEX")   # numeric index for BTC-USDC (e.g., 1)
 
-# one-time SDK clients (created safely with an event loop)
 _CLIENTS_KEY = "_lighter_clients"
 
 def _missing_envs():
@@ -64,48 +63,55 @@ def root():
 
 @app.post("/webhook")
 def webhook():
-    # 1) env sanity
+    # env check
     missing = _missing_envs()
     if missing:
         return jsonify({"ok": False, "error": "missing env vars", "missing": missing}), 500
 
-    # 2) auth
+    # auth
     body = request.get_json(force=True, silent=True) or {}
     if WEBHOOK_SECRET and body.get("secret") != WEBHOOK_SECRET:
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
-    # 3) parse tiny order
+    # inputs
     try:
-        side = str(body.get("side", "buy")).lower()
-        if side not in ("buy", "sell"):
+        side_str = str(body.get("side", "buy")).lower()
+        if side_str not in ("buy", "sell"):
             return jsonify({"ok": False, "error": "side must be 'buy' or 'sell'"}), 400
+        # enum mapping: buy=0, sell=1  (SDK expects int)
+        side_enum = 0 if side_str == "buy" else 1
+
         qty = float(str(body.get("qty", "0.0001")))
         if qty <= 0:
             return jsonify({"ok": False, "error": "qty must be > 0"}), 400
-        base_amount = int(qty * 1_0000_0000)  # example scale 1e8
+        base_amount = int(qty * 1_0000_0000)  # example 1e8 scale
+
         market_index = int(MARKET_INDEX)
     except Exception as e:
         return jsonify({"ok": False, "error": f"bad inputs: {e}"}), 400
 
-    # 4) sign + send
+    # sign & send
     try:
         signer, tx_api = _get_clients()
+
+        # positional args required by SDK (integers where needed)
         signed_tx = signer.sign_create_order(
-            market_index,                              # numeric market index (e.g., BTC-USDC = 1)
-            side,                                      # "buy"/"sell"
+            market_index,                              # int
+            side_enum,                                 # int enum (0=buy,1=sell)
             base_amount,                               # int
             0,                                         # price (0 = market)
             0,                                         # client_order_index
-            "ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL", # TIF
+            "ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL", # TIF (SDK accepts these string constants)
             "ORDER_TYPE_MARKET",                       # type
-            False,                                     # reduce_only
-            0,                                         # trigger_price
+            False,                                     # reduce_only (bool)
+            0,                                         # trigger_price (int)
         )
+
         resp = tx_api.send_tx(signed_tx)
         print("Lighter send_tx response:", resp, flush=True)
         return jsonify({"ok": True, "lighter_response": resp}), 200
+
     except Exception as e:
-        # bubble up the exact SDK/server error once, clearly
         return jsonify({"ok": False, "error": "send_tx failed", "detail": str(e)}), 400
 
 if __name__ == "__main__":
