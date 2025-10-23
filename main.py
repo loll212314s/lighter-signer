@@ -1,4 +1,5 @@
-# main.py — Lighter webhook (final v5: strict signature + awaits)
+# main.py — Lighter webhook (tx = signer.create_market_order(int(market_index), int(base_amount), bool(is_ask), 0)
+: strict signature + awaits)
 import os, json, asyncio, logging
 from flask import Flask, request, jsonify
 import lighter
