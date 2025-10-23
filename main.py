@@ -1,5 +1,5 @@
 
-# main.py — Lighter webhook using SDK (final, is_buy fix)
+# main.py — Lighter webhook using SDK (positional args for create_market_order)
 import os, json, asyncio, logging
 from flask import Flask, request, jsonify
 import lighter  # lighter-python
@@ -22,9 +22,9 @@ _CLIENTS_KEY = "_lighter_clients"
 def _need_envs():
     missing = []
     if not API_PRIV: missing.append("API_KEY_PRIVATE_KEY")
-    if ACCOUNT_INDEX is None: missing.append("ACCOUNT_INDEX")
-    if API_KEY_INDEX is None: missing.append("API_KEY_INDEX")
-    if MARKET_INDEX is None: missing.append("MARKET_INDEX")
+    if ACCOUNT_INDEX is None: miss.append("ACCOUNT_INDEX")
+    if API_KEY_INDEX is None: miss.append("API_KEY_INDEX")
+    if MARKET_INDEX is None: miss.append("MARKET_INDEX")
     return missing
 
 async def _make_clients_async():
@@ -89,11 +89,12 @@ def webhook():
 
     try:
         signer, tx_api = _get_clients()
+        # POSitional args to avoid unexpected keyword errors across SDK versions
         signed_tx = signer.create_market_order(
-            market_index=market_index,
-            is_buy=is_buy,            # FIX here
-            base_amount=base_amount,
-            client_order_index=0,
+            market_index,         # market_index: int
+            is_buy,               # is_buy: bool
+            base_amount,          # base_amount: int
+            0                     # client_order_index: int
         )
         resp = tx_api.send_tx(signed_tx)
         print("Lighter send_tx response:", resp, flush=True)
