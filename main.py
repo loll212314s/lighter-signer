@@ -1,5 +1,5 @@
 
-# main.py — Lighter webhook using SDK (positional args for create_market_order)
+# main.py — Lighter webhook using SDK (final is_ask signature)
 import os, json, asyncio, logging
 from flask import Flask, request, jsonify
 import lighter  # lighter-python
@@ -20,12 +20,12 @@ MARKET_INDEX = os.environ.get("MARKET_INDEX")
 _CLIENTS_KEY = "_lighter_clients"
 
 def _need_envs():
-    missing = []
-    if not API_PRIV: missing.append("API_KEY_PRIVATE_KEY")
+    miss = []
+    if not API_PRIV: miss.append("API_KEY_PRIVATE_KEY")
     if ACCOUNT_INDEX is None: miss.append("ACCOUNT_INDEX")
     if API_KEY_INDEX is None: miss.append("API_KEY_INDEX")
     if MARKET_INDEX is None: miss.append("MARKET_INDEX")
-    return missing
+    return miss
 
 async def _make_clients_async():
     signer = lighter.SignerClient(
@@ -71,7 +71,7 @@ def webhook():
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
     side_str = str(data.get("side", "buy")).lower()
-    is_buy = True if side_str in ("buy", "long") else False
+    is_ask = True if side_str in ("sell","short") else False  # SELL => ask
 
     try:
         qty = float(str(data.get("qty", "0.0001")))
@@ -85,16 +85,17 @@ def webhook():
     except Exception as e:
         return jsonify({"ok": False, "error": f"bad market_index: {e}"}), 400
 
+    # scale to base units (e.g., 1e8)
     base_amount = int(qty * 1_0000_0000)
 
     try:
         signer, tx_api = _get_clients()
-        # POSitional args to avoid unexpected keyword errors across SDK versions
+        # Signature expected by your SDK: (market_index, base_amount, is_ask, client_order_index)
         signed_tx = signer.create_market_order(
-            market_index,         # market_index: int
-            is_buy,               # is_buy: bool
-            base_amount,          # base_amount: int
-            0                     # client_order_index: int
+            int(market_index),
+            int(base_amount),
+            bool(is_ask),
+            0
         )
         resp = tx_api.send_tx(signed_tx)
         print("Lighter send_tx response:", resp, flush=True)
