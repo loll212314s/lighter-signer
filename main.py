@@ -1,7 +1,7 @@
-# main.py — Lighter webhook (dual-sig-v4: await create_market_order + send_tx)
+# main.py — Lighter webhook (final v5: strict signature + awaits)
 import os, json, asyncio, logging
 from flask import Flask, request, jsonify
-import lighter  # pip install lighter-python
+import lighter
 
 logging.getLogger("werkzeug").setLevel(logging.INFO)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -38,15 +38,11 @@ async def _make_clients_async():
     tx_api = lighter.TransactionApi(api_client)
     return signer, tx_api
 
-def _get_loop():
+def _await(coro):
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-    return loop
-
-def _await(coro):
-    loop = _get_loop()
     if loop.is_running():
         return asyncio.run(coro)
     return loop.run_until_complete(coro)
@@ -54,17 +50,13 @@ def _await(coro):
 def _get_clients():
     c = app.config.get(_CLIENTS_KEY)
     if c: return c
-    loop = _get_loop()
-    if loop.is_running():
-        c = asyncio.run(_make_clients_async())
-    else:
-        c = loop.run_until_complete(_make_clients_async())
+    c = _await(_make_clients_async())
     app.config[_CLIENTS_KEY] = c
     return c
 
 @app.get("/")
 def root():
-    return jsonify({"status": "ok", "version": "dual-sig-v4"})
+    return jsonify({"status": "ok", "version": "final-v5"})
 
 @app.post("/webhook")
 def webhook():
@@ -76,8 +68,8 @@ def webhook():
     if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
-    side_str = str(data.get("side", "buy")).lower()
-    is_ask = side_str in ("sell", "short")
+    side = str(data.get("side", "buy")).lower()
+    is_ask = side in ("sell","short")  # sell = ask
 
     try:
         qty = float(str(data.get("qty", "0.0001")))
@@ -91,43 +83,22 @@ def webhook():
     except Exception as e:
         return jsonify({"ok": False, "error": f"bad market_index: {e}"}), 400
 
+    # base units (adjust scale if your market uses different decimals)
     base_amount = int(qty * 1_0000_0000)
 
     try:
         signer, tx_api = _get_clients()
-        mi, ba, ia = int(market_index), int(base_amount), bool(is_ask)
 
-        # Try known create_market_order signatures; **await** if coroutine
-        attempts = [
-            ( (mi, ba, ia, 0), {} ),
-            ( (mi, ia, ba, 0), {} ),
-            ( (), {"market_index": mi, "base_amount": ba, "is_ask": ia, "client_order_index": 0} ),
-            ( (), {"market_index": mi, "is_ask": ia, "base_amount": ba, "client_order_index": 0} ),
-            ( (mi, 0, ba, ia, 0), {} ),
-            ( (mi, 0, ia, ba, 0), {} ),
-        ]
+        # STRICT signature: (market_index, is_ask, base_amount, client_order_index)
+        tx = signer.create_market_order(int(market_index), bool(is_ask), int(base_amount), 0)
+        if asyncio.iscoroutine(tx):
+            tx = _await(tx)
 
-        signed_tx, last_err = None, None
-        for args, kwargs in attempts:
-            try:
-                maybe = signer.create_market_order(*args, **kwargs)
-                if asyncio.iscoroutine(maybe):
-                    maybe = _await(maybe)
-                signed_tx = maybe
-                break
-            except TypeError as e:
-                last_err = str(e)
-                continue
-
-        if not signed_tx:
-            return jsonify({"ok": False, "error": "send_tx failed", "detail": f"no matching create_market_order signature; last: {last_err}"}), 400
-
-        resp = tx_api.send_tx(signed_tx)
+        resp = tx_api.send_tx(tx)
         if asyncio.iscoroutine(resp):
             resp = _await(resp)
 
         return jsonify({"ok": True, "lighter_response": resp}), 200
-
     except Exception as e:
         return jsonify({"ok": False, "error": "send_tx failed", "detail": str(e)}), 400
 
