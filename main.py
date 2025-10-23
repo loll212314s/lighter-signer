@@ -1,4 +1,4 @@
-# main.py — Lighter webhook (create_market_order signature-agnostic, dual-sig-v2)
+# main.py — Lighter webhook (dual-sig-v3, awaits send_tx)
 import os, json, asyncio, logging
 from flask import Flask, request, jsonify
 import lighter  # pip install lighter-python
@@ -53,9 +53,20 @@ def _get_clients():
     app.config[_CLIENTS_KEY] = c
     return c
 
+def _await(coro):
+    # Await coroutine safely from sync Flask route
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+    if loop.is_running():
+        # run in a new loop if current is running (rare in Flask)
+        return asyncio.run(coro)
+    return loop.run_until_complete(coro)
+
 @app.get("/")
 def root():
-    return jsonify({"status": "ok", "version": "dual-sig-v2"})
+    return jsonify({"status": "ok", "version": "dual-sig-v3"})
 
 @app.post("/webhook")
 def webhook():
@@ -67,9 +78,9 @@ def webhook():
     if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
-    # side -> is_ask (sell/short = ask=true, buy/long = ask=false)
+    # side -> is_ask (sell/short = ask)
     side_str = str(data.get("side", "buy")).lower()
-    is_ask = side_str in ("sell", "short")
+    is_ask = side_str in ("sell","short")
 
     # qty
     try:
@@ -85,43 +96,41 @@ def webhook():
     except Exception as e:
         return jsonify({"ok": False, "error": f"bad market_index: {e}"}), 400
 
-    # convert to base units (example scale 1e8)
+    # base units (e.g., 1e8)
     base_amount = int(qty * 1_0000_0000)
 
     try:
         signer, tx_api = _get_clients()
+        mi, ba, ia = int(market_index), int(base_amount), bool(is_ask)
 
-        # Try multiple known SDK signatures. We stop at the first that works.
-        mi = int(market_index); ba = int(base_amount); ia = bool(is_ask)
+        # Try known SDK signatures until one works
         attempts = [
-            ( (mi, ba, ia, 0), {} ),                                # A: (mi, base_amount, is_ask, coi)
-            ( (mi, ia, ba, 0), {} ),                                # B: (mi, is_ask, base_amount, coi)
-            ( (), {"market_index": mi, "base_amount": ba, "is_ask": ia, "client_order_index": 0} ),   # C kwargs
-            ( (), {"market_index": mi, "is_ask": ia, "base_amount": ba, "client_order_index": 0} ),   # D kwargs alt
-            ( (mi, 0, ba, ia, 0), {} ),                             # E: (mi, price=0, base_amount, is_ask, coi)
-            ( (mi, 0, ia, ba, 0), {} ),                             # F: (mi, price=0, is_ask, base_amount, coi)
+            ( (mi, ba, ia, 0), {} ),  # (mi, base_amount, is_ask, coi)
+            ( (mi, ia, ba, 0), {} ),  # (mi, is_ask, base_amount, coi)
+            ( (), {"market_index": mi, "base_amount": ba, "is_ask": ia, "client_order_index": 0} ),
+            ( (), {"market_index": mi, "is_ask": ia, "base_amount": ba, "client_order_index": 0} ),
+            ( (mi, 0, ba, ia, 0), {} ),  # (mi, price=0, base_amount, is_ask, coi)
+            ( (mi, 0, ia, ba, 0), {} ),  # (mi, price=0, is_ask, base_amount, coi)
         ]
 
-        last_err = None
-        signed_tx = None
+        signed_tx, last_err = None, None
         for args, kwargs in attempts:
             try:
                 signed_tx = signer.create_market_order(*args, **kwargs)
-                print("create_market_order pattern OK:", (args or kwargs), flush=True)
+                print("create_market_order OK with pattern:", (args or kwargs), flush=True)
                 break
             except TypeError as e:
                 last_err = str(e)
                 continue
 
         if not signed_tx:
-            return jsonify({
-                "ok": False,
-                "error": "send_tx failed",
-                "detail": f"no matching create_market_order signature; last: {last_err}"
-            }), 400
+            return jsonify({"ok": False, "error": "send_tx failed", "detail": f"no matching create_market_order signature; last: {last_err}"}), 400
 
         resp = tx_api.send_tx(signed_tx)
-        print("Lighter send_tx response:", resp, flush=True)
+        if asyncio.iscoroutine(resp):
+            resp = _await(resp)
+
+        print("Lighter send_tx response (resolved):", resp, flush=True)
         return jsonify({"ok": True, "lighter_response": resp}), 200
 
     except Exception as e:
