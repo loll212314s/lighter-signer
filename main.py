@@ -1,73 +1,47 @@
-import os, json, asyncio, logging, urllib.request, urllib.error
+# main.py  — final, minimal, no guessing
+import os, json, asyncio, logging
 from flask import Flask, request, jsonify
-import lighter  # from requirements.txt
+import lighter  # from requirements.txt (lighter-python)
 
-# tame noisy logs
+# keep logs calm
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 logging.getLogger("werkzeug").setLevel(logging.INFO)
 
 app = Flask(__name__)
 
-BASE_URL       = os.environ.get("BASE_URL", "https://mainnet.zklighter.elliot.ai").rstrip("/")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-API_PRIV       = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTER_PRIVATE_KEY")
-ACCOUNT_INDEX  = int(os.environ.get("ACCOUNT_INDEX", "0"))
-API_KEY_INDEX  = int(os.environ.get("API_KEY_INDEX", "0"))
+# --- ENV (REQUIRED) ---
+BASE_URL        = os.environ.get("BASE_URL", "https://mainnet.zklighter.elliot.ai").rstrip("/")
+WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "")  # set already
+API_PRIV        = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTER_PRIVATE_KEY")
+ACCOUNT_INDEX   = os.environ.get("ACCOUNT_INDEX")        # string -> later int
+API_KEY_INDEX   = os.environ.get("API_KEY_INDEX")        # string -> later int
+MARKET_INDEX    = os.environ.get("MARKET_INDEX")         # string -> later int (symbol index, e.g., BTC-USDC => 1)
 
+# one-time SDK clients (created safely with an event loop)
 _CLIENTS_KEY = "_lighter_clients"
-_MARKET_CACHE = "_market_index_cache"
 
-def _http_json(path: str):
-    """GET JSON from Lighter REST, try both markets endpoints."""
-    url = f"{BASE_URL}{path}"
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-def resolve_market_index(symbol: str) -> int:
-    """Return numeric market index for a symbol like 'BTC-USDC' or 'BTC_USDC'."""
-    sym = symbol.upper().replace("_", "-")
-    cache = app.config.get(_MARKET_CACHE, {})
-    if sym in cache:
-        return cache[sym]
-
-    # try the common endpoints
-    for path in ("/api/v1/markets", "/api/v1/getMarkets"):
-        try:
-            data = _http_json(path)
-        except Exception:
-            continue
-
-        markets = data.get("markets", data)
-        if isinstance(markets, list):
-            for m in markets:
-                ms = (m.get("symbol") or m.get("name") or "").upper().replace("_", "-")
-                if ms == sym:
-                    idx = m.get("market_index", m.get("index", m.get("id")))
-                    if idx is None:
-                        continue
-                    idx = int(idx)
-                    cache[sym] = idx
-                    app.config[_MARKET_CACHE] = cache
-                    return idx
-
-    # fallback: let caller see a clear error
-    raise ValueError(f"Could not resolve market index for {sym}")
+def _missing_envs():
+    miss = []
+    if not API_PRIV: miss.append("API_KEY_PRIVATE_KEY")
+    if ACCOUNT_INDEX is None: miss.append("ACCOUNT_INDEX")
+    if API_KEY_INDEX is None: miss.append("API_KEY_INDEX")
+    if MARKET_INDEX is None: miss.append("MARKET_INDEX")
+    return miss
 
 async def _make_clients_async():
     signer = lighter.SignerClient(
         url=BASE_URL,
         private_key=API_PRIV,
-        account_index=ACCOUNT_INDEX,
-        api_key_index=API_KEY_INDEX,
+        account_index=int(ACCOUNT_INDEX),
+        api_key_index=int(API_KEY_INDEX),
     )
     cfg = lighter.Configuration(host=BASE_URL)
     api_client = lighter.ApiClient(configuration=cfg)
     tx_api = lighter.TransactionApi(api_client)
     return signer, tx_api
 
-def get_clients():
+def _get_clients():
     clients = app.config.get(_CLIENTS_KEY)
     if clients is not None:
         return clients
@@ -90,39 +64,49 @@ def root():
 
 @app.post("/webhook")
 def webhook():
+    # 1) env sanity
+    missing = _missing_envs()
+    if missing:
+        return jsonify({"ok": False, "error": "missing env vars", "missing": missing}), 500
+
+    # 2) auth
     body = request.get_json(force=True, silent=True) or {}
     if WEBHOOK_SECRET and body.get("secret") != WEBHOOK_SECRET:
         return jsonify({"ok": False, "error": "bad secret"}), 401
 
-    # inputs
-    symbol = str(body.get("symbol", "BTC-USDC"))
-    side   = str(body.get("side", "buy")).lower()
-    qty    = float(str(body.get("qty", "0.0001")))
-    base_amount = int(qty * 1_0000_0000)  # example 1e8 scale
-
+    # 3) parse tiny order
     try:
-        market_index = resolve_market_index(symbol)
+        side = str(body.get("side", "buy")).lower()
+        if side not in ("buy", "sell"):
+            return jsonify({"ok": False, "error": "side must be 'buy' or 'sell'"}), 400
+        qty = float(str(body.get("qty", "0.0001")))
+        if qty <= 0:
+            return jsonify({"ok": False, "error": "qty must be > 0"}), 400
+        base_amount = int(qty * 1_0000_0000)  # example scale 1e8
+        market_index = int(MARKET_INDEX)
     except Exception as e:
-        return jsonify({"ok": False, "error": f"market lookup failed: {e}"}), 400
+        return jsonify({"ok": False, "error": f"bad inputs: {e}"}), 400
 
-    signer, tx_api = get_clients()
-
-    # POSitional args (SDK requires these), include reduce_only & trigger_price
-    signed_tx = signer.sign_create_order(
-        market_index,                              # <-- numeric market index
-        side,                                      # "buy"/"sell"
-        base_amount,                               # int
-        0,                                         # price (0 = market)
-        0,                                         # client_order_index
-        "ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
-        "ORDER_TYPE_MARKET",
-        False,                                     # reduce_only
-        0,                                         # trigger_price
-    )
-
-    resp = tx_api.send_tx(signed_tx)
-    print("Lighter send_tx response:", resp, flush=True)
-    return jsonify({"ok": True, "lighter_response": resp})
+    # 4) sign + send
+    try:
+        signer, tx_api = _get_clients()
+        signed_tx = signer.sign_create_order(
+            market_index,                              # numeric market index (e.g., BTC-USDC = 1)
+            side,                                      # "buy"/"sell"
+            base_amount,                               # int
+            0,                                         # price (0 = market)
+            0,                                         # client_order_index
+            "ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL", # TIF
+            "ORDER_TYPE_MARKET",                       # type
+            False,                                     # reduce_only
+            0,                                         # trigger_price
+        )
+        resp = tx_api.send_tx(signed_tx)
+        print("Lighter send_tx response:", resp, flush=True)
+        return jsonify({"ok": True, "lighter_response": resp}), 200
+    except Exception as e:
+        # bubble up the exact SDK/server error once, clearly
+        return jsonify({"ok": False, "error": "send_tx failed", "detail": str(e)}), 400
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
