@@ -98,8 +98,10 @@ def webhook():
 
     try:
         signer, tx_api = _get_clients()
-        # STRICT signature your SDK expects: (market_index, base_amount, is_ask, client_order_index)
-        tx = signer.create_market_order(int(market_index), int(base_amount), bool(is_ask), 0)
+
+        # STRICT signature your SDK expects:
+        # (market_index, is_ask, base_amount, client_order_index)
+        tx = signer.create_market_order(int(market_index), bool(is_ask), int(base_amount), 0)
         if asyncio.iscoroutine(tx):
             tx = _await(tx)
 
