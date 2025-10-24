@@ -1,4 +1,4 @@
-# main.py — Lighter webhook (final v5: strict signature + awaits)
+# main.py — Lighter webhook (final-v6: strict signature + awaits + logs)
 import os, json, asyncio, logging
 from flask import Flask, request, jsonify
 import lighter
@@ -14,7 +14,7 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 API_PRIV = os.environ.get("API_KEY_PRIVATE_KEY") or os.environ.get("LIGHTER_PRIVATE_KEY")
 ACCOUNT_INDEX = os.environ.get("ACCOUNT_INDEX")
 API_KEY_INDEX = os.environ.get("API_KEY_INDEX")
-MARKET_INDEX = os.environ.get("MARKET_INDEX")
+MARKET_INDEX = os.environ.get("MARKET_INDEX")  # default market id
 
 _CLIENTS_KEY = "_lighter_clients"
 
@@ -56,38 +56,49 @@ def _get_clients():
 
 @app.get("/")
 def root():
-    return jsonify({"status": "ok", "version": "final-v5"})
+    return jsonify({"status": "ok", "version": "final-v6"})
 
 @app.post("/webhook")
 def webhook():
     miss = _need_envs()
     if miss:
-        return jsonify({"ok": False, "error": "missing env", "need": miss}), 400
+        err = {"ok": False, "error": "missing env", "need": miss}
+        print("ERR:", err, flush=True)
+        return jsonify(err), 400
 
     data = request.get_json(force=True, silent=True) or {}
     if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
-        return jsonify({"ok": False, "error": "bad secret"}), 401
+        err = {"ok": False, "error": "bad secret"}
+        print("ERR:", err, "BODY:", data, flush=True)
+        return jsonify(err), 401
 
     side = str(data.get("side", "buy")).lower()
-    is_ask = side in ("sell","short")  # sell = ask
+    is_ask = side in ("sell", "short")  # sell = ask
 
     try:
         qty = float(str(data.get("qty", "0.0001")))
     except Exception:
-        return jsonify({"ok": False, "error": "bad qty"}), 400
+        err = {"ok": False, "error": "bad qty", "got": data.get("qty")}
+        print("ERR:", err, "BODY:", data, flush=True)
+        return jsonify(err), 400
     if qty <= 0:
-        return jsonify({"ok": False, "error": "qty must be > 0"}), 400
+        err = {"ok": False, "error": "qty must be > 0", "got": qty}
+        print("ERR:", err, "BODY:", data, flush=True)
+        return jsonify(err), 400
 
     try:
         market_index = int(data.get("market_index", MARKET_INDEX))
     except Exception as e:
-        return jsonify({"ok": False, "error": f"bad market_index: {e}"}), 400
+        err = {"ok": False, "error": f"bad market_index: {e}", "got": data.get("market_index")}
+        print("ERR:", err, "BODY:", data, flush=True)
+        return jsonify(err), 400
 
-    base_amount = int(qty * 1_0000_0000)  # adjust scale if needed
+    # base units (adjust scale if your market uses different decimals)
+    base_amount = int(qty * 1_0000_0000)
 
     try:
         signer, tx_api = _get_clients()
-        # STRICT order your SDK expects: (market_index, base_amount, is_ask, client_order_index)
+        # STRICT signature your SDK expects: (market_index, base_amount, is_ask, client_order_index)
         tx = signer.create_market_order(int(market_index), int(base_amount), bool(is_ask), 0)
         if asyncio.iscoroutine(tx):
             tx = _await(tx)
@@ -96,10 +107,17 @@ def webhook():
         if asyncio.iscoroutine(resp):
             resp = _await(resp)
 
+        print("OK send_tx:", resp, flush=True)
         return jsonify({"ok": True, "lighter_response": resp}), 200
+
     except Exception as e:
-        return jsonify({"ok": False, "error": "send_tx failed", "detail": str(e)}), 400
+        app.logger.exception("send_tx failed")
+        err = {"ok": False, "error": "send_tx failed", "detail": str(e)}
+        print("ERR:", err, "BODY:", data, flush=True)
+        return jsonify(err), 400
 
 if __name__ == "__main__":
+    # Ensure unbuffered logs in Render
+    os.environ["PYTHONUNBUFFERED"] = "1"
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
