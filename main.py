@@ -1,5 +1,4 @@
-# main.py — Lighter webhook (tx = signer.create_market_order(int(market_index), int(base_amount), bool(is_ask), 0)
-: strict signature + awaits)
+# main.py — Lighter webhook (final v5: strict signature + awaits)
 import os, json, asyncio, logging
 from flask import Flask, request, jsonify
 import lighter
@@ -84,14 +83,12 @@ def webhook():
     except Exception as e:
         return jsonify({"ok": False, "error": f"bad market_index: {e}"}), 400
 
-    # base units (adjust scale if your market uses different decimals)
-    base_amount = int(qty * 1_0000_0000)
+    base_amount = int(qty * 1_0000_0000)  # adjust scale if needed
 
     try:
         signer, tx_api = _get_clients()
-
-        # STRICT signature: (market_index, is_ask, base_amount, client_order_index)
-        tx = signer.create_market_order(int(market_index), bool(is_ask), int(base_amount), 0)
+        # STRICT order your SDK expects: (market_index, base_amount, is_ask, client_order_index)
+        tx = signer.create_market_order(int(market_index), int(base_amount), bool(is_ask), 0)
         if asyncio.iscoroutine(tx):
             tx = _await(tx)
 
